@@ -1,94 +1,85 @@
 import { TICKER_SYMBOLS, getTwelveDataSymbol } from '@/lib/symbols';
 
-// Cache prices for 5 minutes to stay within Twelve Data free tier limits
 let cache = { data: null, timestamp: 0 };
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL = 5 * 60 * 1000;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export async function GET() {
   const now = Date.now();
 
-  // Return cached data if fresh
   if (cache.data && (now - cache.timestamp) < CACHE_TTL) {
     return Response.json({ prices: cache.data, cached: true, updated: new Date(cache.timestamp).toISOString() });
   }
 
   const apiKey = process.env.TWELVE_DATA_API_KEY;
   if (!apiKey) {
-    return Response.json({ error: 'TWELVE_DATA_API_KEY not set', prices: getFallbackPrices() }, { status: 200 });
+    return Response.json({ prices: getFallbackPrices(), error: 'NO_API_KEY', updated: new Date(now).toISOString() });
   }
 
-  try {
-    // Batch request — Twelve Data supports comma-separated symbols
-    // Split into equities and forex/commodity batches
-    const equitySymbols = [];
-    const forexSymbols = [];
+  const prices = {};
+  const equityKeys = [];
+  const forexKeys = [];
 
-    for (const key of TICKER_SYMBOLS) {
-      const sym = getTwelveDataSymbol(key);
-      if (sym.includes('/')) {
-        forexSymbols.push({ key, symbol: sym });
-      } else {
-        equitySymbols.push({ key, symbol: sym });
-      }
+  for (const key of TICKER_SYMBOLS) {
+    const sym = getTwelveDataSymbol(key);
+    if (sym.includes('/')) {
+      forexKeys.push({ key, symbol: sym });
+    } else {
+      equityKeys.push({ key, symbol: sym });
     }
+  }
 
-    const prices = {};
+  // Fetch equities in small batches of 5
+  const chunks = [];
+  for (let i = 0; i < equityKeys.length; i += 5) {
+    chunks.push(equityKeys.slice(i, i + 5));
+  }
 
-    // Fetch equities batch
-    if (equitySymbols.length > 0) {
-      const syms = equitySymbols.map(s => s.symbol).join(',');
-      const url = `https://api.twelvedata.com/price?symbol=${syms}&apikey=${apiKey}`;
-      const res = await fetch(url, { next: { revalidate: 300 } });
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    const syms = chunk.map(s => s.symbol).join(',');
+    try {
+      const res = await fetch(`https://api.twelvedata.com/price?symbol=${syms}&apikey=${apiKey}`);
       const data = await res.json();
-
-      // Twelve Data returns { SYMBOL: { price: "123.45" } } for batch requests
-      // or { price: "123.45" } for single symbol
-      if (equitySymbols.length === 1) {
-        const key = equitySymbols[0].key;
-        prices[key] = data.price ? parseFloat(data.price) : null;
+      if (chunk.length === 1) {
+        prices[chunk[0].key] = data.price ? parseFloat(data.price) : null;
       } else {
-        for (const { key, symbol } of equitySymbols) {
-          if (data[symbol] && data[symbol].price) {
-            prices[key] = parseFloat(data[symbol].price);
-          } else {
-            prices[key] = null;
-          }
+        for (const { key, symbol } of chunk) {
+          prices[key] = data[symbol]?.price ? parseFloat(data[symbol].price) : null;
         }
       }
+    } catch (e) {
+      for (const { key } of chunk) prices[key] = null;
     }
-
-    // Fetch forex/commodity individually (Twelve Data doesn't batch forex well)
-    for (const { key, symbol } of forexSymbols) {
-      try {
-        const url = `https://api.twelvedata.com/price?symbol=${symbol}&apikey=${apiKey}`;
-        const res = await fetch(url, { next: { revalidate: 300 } });
-        const data = await res.json();
-        prices[key] = data.price ? parseFloat(data.price) : null;
-      } catch {
-        prices[key] = null;
-      }
-    }
-
-    // Update cache
-    cache = { data: prices, timestamp: now };
-
-    return Response.json({
-      prices,
-      cached: false,
-      updated: new Date(now).toISOString(),
-    });
-  } catch (error) {
-    console.error('Twelve Data fetch error:', error);
-    return Response.json({
-      error: error.message,
-      prices: cache.data || getFallbackPrices(),
-      cached: true,
-      updated: cache.timestamp ? new Date(cache.timestamp).toISOString() : null,
-    });
+    if (ci < chunks.length - 1 || forexKeys.length > 0) await sleep(9000);
   }
+
+  // Fetch forex one at a time
+  for (let fi = 0; fi < forexKeys.length; fi++) {
+    const { key, symbol } = forexKeys[fi];
+    try {
+      const res = await fetch(`https://api.twelvedata.com/price?symbol=${symbol}&apikey=${apiKey}`);
+      const data = await res.json();
+      prices[key] = data.price ? parseFloat(data.price) : null;
+    } catch (e) {
+      prices[key] = null;
+    }
+    if (fi < forexKeys.length - 1) await sleep(9000);
+  }
+
+  // Fill nulls with fallback
+  const fb = getFallbackPrices();
+  for (const key of TICKER_SYMBOLS) {
+    if (prices[key] == null) prices[key] = fb[key] ?? null;
+  }
+
+  cache = { data: prices, timestamp: now };
+  return Response.json({ prices, cached: false, updated: new Date(now).toISOString() });
 }
 
-// Fallback prices if API is unavailable (last known as of Apr 4, 2026)
 function getFallbackPrices() {
   return {
     WTI: 111.54, XAU: 4677, XAG: 73.03,
