@@ -1,7 +1,7 @@
 import { TICKER_SYMBOLS, getTwelveDataSymbol } from '@/lib/symbols';
 
 let cache = { data: null, timestamp: 0 };
-const CACHE_TTL = 5 * 60 * 1000;
+const CACHE_TTL = 0;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
